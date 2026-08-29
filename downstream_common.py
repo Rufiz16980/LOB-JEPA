@@ -3,14 +3,13 @@ downstream_common.py
 ────────────────────
 Shared Library for Phase 2 Downstream Probe Probing & Evaluation.
 
-Contains:
-  1. Strict Metadata-Based Checkpoint Selector (argmin validation loss)
-  2. Verbatim Model Architectures (Encoders & SharedDecoder)
-  3. Trend Label Generator (FI-2010 Z-score protocol, train-split thresholding)
-  4. TrendHead (Single Linear Layer Probe)
-  5. Contiguous Masking & Masked Loss Function for Imputation
-  6. Low-Resource Transfer Harness (20% Target Train Split Fine-Tuning)
-  7. High-Performance Latent Cacher & Probe Trainers
+Strict Compliance:
+  1. Imports split_by_date, detect_sessions, get_window_indices directly from common.py
+  2. Strict metadata-based checkpoint selector (argmin validation loss)
+  3. Load state dict assertions: assert len(result.missing_keys) == 0
+  4. Train-only quantile thresholding (33.3% / 33.3% / 33.3% empirical balance)
+  5. Contiguous 20-step masking with masked-only loss & MAE metrics
+  6. Frozen encoder representations with zero gradient leakage
 
 Author: Phase 2 Downstream Probe Suite
 """
@@ -18,6 +17,7 @@ Author: Phase 2 Downstream Probe Suite
 import os
 import glob
 import math
+import random
 import numpy as np
 import pandas as pd
 import torch
@@ -25,6 +25,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import f1_score, accuracy_score, precision_recall_fscore_support
+
+# Direct imports from Phase 1 (Strictly read-only)
+from common import split_by_date, detect_sessions, get_window_indices
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  STRICT METADATA-BASED CHECKPOINT SELECTOR (ARGMIN VAL LOSS)
@@ -282,49 +285,34 @@ LATENT_DIM = 256
 SEQ_LEN = 100
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3.  DATA UTILITIES & SESSION DETECTOR
-# ─────────────────────────────────────────────────────────────────────────────
-
 def set_seed(seed=42):
-    torch.manual_seed(seed)
+    random.seed(seed)
     np.random.seed(seed)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
-def detect_sessions(df: pd.DataFrame, max_gap_seconds=300):
-    timestamps = pd.to_datetime(df['index'])
-    diffs = timestamps.diff().dt.total_seconds().fillna(0)
-    session_ids = (diffs > max_gap_seconds).cumsum().values
-    return session_ids
-
-
-def split_by_date(df: pd.DataFrame, train_ratio=0.8, val_ratio=0.1):
-    dates = pd.to_datetime(df['index'].str.split().str[0])
-    unique_dates = np.sort(dates.unique())
-    n_dates = len(unique_dates)
-    train_cutoff = unique_dates[int(n_dates * train_ratio)]
-    val_cutoff = unique_dates[int(n_dates * (train_ratio + val_ratio))]
-
-    train_mask = dates < train_cutoff
-    val_mask = (dates >= train_cutoff) & (dates < val_cutoff)
-    test_mask = dates >= val_cutoff
-    return train_mask.values, val_mask.values, test_mask.values
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4.  TREND LABEL GENERATION (FI-2010 PROTOCOL, TRAIN-ONLY THRESHOLD)
+# 3.  TREND LABEL GENERATION (FI-2010 PROTOCOL, EMPIRICAL TRAIN PERCENTILES)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_trend_labels_and_windows(df: pd.DataFrame, k=5, seq_len=100):
     """
-    Computes 3-class trend labels:
+    Computes 3-class trend labels using exact Phase 1 split_by_date and detect_sessions:
       mid(t) = (BidPrice1(t) + AskPrice1(t)) / 2
       m_past(t) = mean(mid(t-k+1) ... mid(t))
       m_future(t) = mean(mid(t+1) ... mid(t+k))
       l(t) = m_future(t) - m_past(t)  (raw difference)
-      threshold θ: 33rd/67th percentile computed on TRAIN split only.
+      thresholds θ_down, θ_up: empirical 33.33rd and 66.67th percentiles of TRAIN split.
     """
     train_mask, val_mask, test_mask = split_by_date(df)
     session_ids = detect_sessions(df)
@@ -333,30 +321,19 @@ def compute_trend_labels_and_windows(df: pd.DataFrame, k=5, seq_len=100):
     mid = ((df['BidPrice1'] + df['AskPrice1']) / 2.0).values
     N = len(df)
     
-    # Rolling averages: past k and future k
-    # m_past(t): average of mid[t-k+1 : t+1]
-    # m_future(t): average of mid[t+1 : t+k+1]
+    # Rolling averages
     m_past = pd.Series(mid).rolling(window=k).mean().values
-    # Future rolling mean by reversing, rolling, and reversing back
     m_future = pd.Series(mid[::-1]).rolling(window=k).mean().values[::-1]
-    # Shift m_future so m_future[t] is mean of mid[t+1 : t+k+1]
     m_future_shifted = np.full_like(mid, np.nan)
     if N > k:
         m_future_shifted[:-k] = m_future[k:]
     
     raw_signal = m_future_shifted - m_past  # l(t) where t is window end
     
-    # Identify valid window start positions i (where input window is [i : i+seq_len])
-    # The end of the window is t = i + seq_len - 1
-    # Validity requires:
-    #   1. session_ids[i] == session_ids[i + seq_len - 1] (entire window in same session)
-    #   2. session_ids[i + seq_len - 1] == session_ids[i + seq_len - 1 + k] (future k ticks in same session)
-    #   3. i + seq_len - 1 + k < N
-    
     split_indices = {'train': [], 'val': [], 'test': []}
     split_signals = {'train': [], 'val': [], 'test': []}
     
-    for i in range(N - seq_len - k):
+    for i in range(N - seq_len - k + 1):
         t_end = i + seq_len - 1
         t_fut = t_end + k
         
@@ -377,27 +354,24 @@ def compute_trend_labels_and_windows(df: pd.DataFrame, k=5, seq_len=100):
     train_signals = np.array(split_signals['train'])
     assert len(train_signals) > 0, "No valid training windows found"
 
-    # Compute threshold θ from TRAIN SPLIT ONLY (33rd / 67th percentile)
-    # Class 0: Down (l < -θ), Class 1: Stable (-θ <= l <= θ), Class 2: Up (l > θ)
-    # Using symmetric threshold from 67th percentile of absolute signal or percentile boundaries
-    p33 = np.percentile(train_signals, 33.33)
-    p67 = np.percentile(train_signals, 66.67)
-    theta = (abs(p33) + abs(p67)) / 2.0
+    # Compute empirical 33.33rd and 66.67th percentiles on TRAIN split only
+    theta_down = float(np.percentile(train_signals, 33.333))
+    theta_up   = float(np.percentile(train_signals, 66.667))
     
     # Assign labels
     split_labels = {}
     for split in ['train', 'val', 'test']:
         sigs = np.array(split_signals[split])
         labs = np.ones(len(sigs), dtype=np.int64)  # default 1 (stable)
-        labs[sigs < -theta] = 0                    # 0: Down
-        labs[sigs > theta] = 2                     # 2: Up
+        labs[sigs < theta_down] = 0                # 0: Down
+        labs[sigs > theta_up]   = 2                # 2: Up
         split_labels[split] = labs
 
-    return split_indices, split_labels, theta
+    return split_indices, split_labels, (theta_down, theta_up)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5.  PROBE ARCHITECTURES & LOSS FUNCTIONS
+# 4.  PROBE ARCHITECTURES & LOSS FUNCTIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TrendHead(nn.Module):
@@ -427,7 +401,6 @@ class LatentDataset(Dataset):
 def imputation_loss(output, target, mask):
     """Loss computed STRICTLY on masked positions only."""
     diff = (output - target) ** 2
-    # mask: [B, 100] boolean, True = masked position
     masked_diff = diff[mask.unsqueeze(-1).expand_as(diff)]
     return masked_diff.mean()
 
@@ -467,7 +440,7 @@ class ContiguousMaskingDataset(Dataset):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6.  HIGH-PERFORMANCE LATENT CACHER
+# 5.  VERIFIED CHECKPOINT LOADING & LATENT CACHER
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_frozen_encoder(model_name: str, stock: str, device='cuda') -> nn.Module:
@@ -489,7 +462,16 @@ def load_frozen_encoder(model_name: str, stock: str, device='cuda') -> nn.Module
         elif not k.startswith('decoder.'):
             encoder_dict[k] = v
             
-    encoder.load_state_dict(encoder_dict, strict=False)
+    # Strict missing keys verification (asserts 100% parameter coverage)
+    load_result = encoder.load_state_dict(encoder_dict, strict=False)
+    assert len(load_result.missing_keys) == 0, (
+        f"FATAL: Missing keys when loading {model_name} encoder: {load_result.missing_keys}"
+    )
+    if load_result.unexpected_keys:
+        non_decoder = [k for k in load_result.unexpected_keys if not k.startswith('decoder.')]
+        if non_decoder:
+            print(f"  [Warning] Non-decoder unexpected keys ignored: {non_decoder}")
+
     encoder.to(device)
     encoder.eval()
     for param in encoder.parameters():
@@ -503,7 +485,7 @@ def precompute_and_cache_latents(model_name: str, stock: str, out_dir: str = "la
     
     csv_path = f"data/{stock}-level10_processed.csv"
     df = pd.read_csv(csv_path)
-    split_indices, split_labels, theta = compute_trend_labels_and_windows(df, k=5, seq_len=SEQ_LEN)
+    split_indices, split_labels, thetas = compute_trend_labels_and_windows(df, k=5, seq_len=SEQ_LEN)
     features = df.iloc[:, 1:].values
     
     encoder = load_frozen_encoder(model_name, stock, device=device)
@@ -531,13 +513,13 @@ def precompute_and_cache_latents(model_name: str, stock: str, out_dir: str = "la
         np.save(f"{out_dir}/{model_name}/{stock}/{split}_labels.npy", labels)
         cached_data[split] = (all_z, labels)
         
-    np.save(f"{out_dir}/{model_name}/{stock}/theta.npy", np.array([theta]))
-    print(f"  ✓ Cached {model_name}/{stock}: Train {cached_data['train'][0].shape}, Val {cached_data['val'][0].shape}, Test {cached_data['test'][0].shape} (θ={theta:.6f})")
+    np.save(f"{out_dir}/{model_name}/{stock}/thetas.npy", np.array(thetas))
+    print(f"  ✓ Cached {model_name}/{stock}: Train {cached_data['train'][0].shape}, Val {cached_data['val'][0].shape}, Test {cached_data['test'][0].shape} (θ_down={thetas[0]:.6f}, θ_up={thetas[1]:.6f})")
     return cached_data
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7.  PROBE TRAINER FUNCTIONS
+# 6.  PROBE TRAINER FUNCTIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train_trend_head_probe(train_z, train_y, val_z, val_y, test_z, test_y, epochs=50, lr=1e-3, batch_size=256, device='cuda'):
@@ -610,7 +592,6 @@ def train_imputation_probe(model_name: str, stock: str, epochs=50, lr=1e-3, batc
     session_ids = detect_sessions(df)
     features = df.iloc[:, 1:].values
     
-    from common import get_window_indices, LOBDataset
     train_starts = get_window_indices(df, train_mask, session_ids, seq_len=SEQ_LEN)
     val_starts = get_window_indices(df, val_mask, session_ids, seq_len=SEQ_LEN)
     test_starts = get_window_indices(df, test_mask, session_ids, seq_len=SEQ_LEN)
@@ -619,9 +600,12 @@ def train_imputation_probe(model_name: str, stock: str, epochs=50, lr=1e-3, batc
     val_ds = ContiguousMaskingDataset(features, val_starts, seq_len=SEQ_LEN, mask_len=20)
     test_ds = ContiguousMaskingDataset(features, test_starts, seq_len=SEQ_LEN, mask_len=20)
     
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    g = torch.Generator()
+    g.manual_seed(42)
+    
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=2, worker_init_fn=seed_worker, generator=g)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=2, worker_init_fn=seed_worker, generator=g)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=2, worker_init_fn=seed_worker, generator=g)
     
     encoder = load_frozen_encoder(model_name, stock, device=device)
     decoder = SharedDecoder(latent_dim=LATENT_DIM, n_features=40, seq_len=SEQ_LEN).to(device)
