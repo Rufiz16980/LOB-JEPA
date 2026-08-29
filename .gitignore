@@ -1,0 +1,25 @@
+# Datasets
+data/
+*.csv
+*.xlsx
+*.pkl
+*.tar.gz
+
+# Checkpoints and Logs
+checkpoints/
+training_logs/
+*.ckpt
+*.log
+
+# Python/Jupyter caching
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+
+# Virtual environments
+venv/
+.env/
+env/
+
+# OS files
+.DS_Store
