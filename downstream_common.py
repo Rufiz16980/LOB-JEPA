@@ -481,6 +481,12 @@ def load_frozen_encoder(model_name: str, stock: str, device='cuda') -> nn.Module
 
 def precompute_and_cache_latents(model_name: str, stock: str, out_dir: str = "latents", device='cuda'):
     """Precomputes and caches [N, 256] latents for train, val, and test splits."""
+    train_file = f"{out_dir}/{model_name}/{stock}/train_latents.npy"
+    thetas_file = f"{out_dir}/{model_name}/{stock}/thetas.npy"
+    if os.path.exists(train_file) and os.path.exists(thetas_file):
+        print(f"  ✓ Found cached latents: {model_name}/{stock} (skipping)")
+        return {}
+        
     os.makedirs(f"{out_dir}/{model_name}/{stock}", exist_ok=True)
     
     csv_path = f"data/{stock}-level10_processed.csv"

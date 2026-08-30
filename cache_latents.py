@@ -4,7 +4,9 @@ cache_latents.py
 Precomputes and saves [N, 256] latents for all 6 models across all 5 stocks.
 Saves: latents/{model_name}/{stock}/{train,val,test}_latents.npy
        latents/{model_name}/{stock}/{train,val,test}_labels.npy
-       latents/{model_name}/{stock}/theta.npy
+       latents/{model_name}/{stock}/thetas.npy
+
+Instantly skips any model/stock pair that already has cached latents on disk.
 
 Usage on Colab:
     !python cache_latents.py
@@ -28,12 +30,20 @@ def main():
     total_start = time.time()
     count = 0
     total = len(MODEL_REGISTRY) * len(STOCKS)
+    skipped = 0
 
     for model_name in MODEL_REGISTRY.keys():
         print(f"\n[{model_name}]")
         for stock in STOCKS:
             count += 1
-            print(f"({count}/{total}) Caching {model_name} / {stock} ...")
+            train_path = f"latents/{model_name}/{stock}/train_latents.npy"
+            theta_path = f"latents/{model_name}/{stock}/thetas.npy"
+            if os.path.exists(train_path) and os.path.exists(theta_path):
+                print(f"  ({count}/{total}) ✓ Found cached latents: {model_name} / {stock} (skipping)")
+                skipped += 1
+                continue
+                
+            print(f"  ({count}/{total}) Caching {model_name} / {stock} ...")
             t0 = time.time()
             try:
                 precompute_and_cache_latents(model_name, stock, out_dir="latents", device=device)
@@ -42,7 +52,10 @@ def main():
                 print(f"    ❌ ERROR caching {model_name}/{stock}: {e}")
 
     print("\n" + "=" * 80)
-    print(f"  LATENT PRECOMPUTATION COMPLETE ({time.time() - total_start:.1f}s)")
+    if skipped == total:
+        print(f"  ALL {total} LATENT REPRESENTATIONS READY FROM CACHE ({time.time() - total_start:.2f}s)")
+    else:
+        print(f"  LATENT PRECOMPUTATION COMPLETE ({time.time() - total_start:.1f}s)")
     print("=" * 80)
 
 if __name__ == '__main__':
