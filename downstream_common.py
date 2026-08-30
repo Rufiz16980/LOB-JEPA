@@ -326,7 +326,7 @@ def compute_trend_labels_and_windows(df: pd.DataFrame, k=5, seq_len=100):
     m_future = pd.Series(mid[::-1]).rolling(window=k).mean().values[::-1]
     m_future_shifted = np.full_like(mid, np.nan)
     if N > k:
-        m_future_shifted[:-k] = m_future[k:]
+        m_future_shifted[:-1] = m_future[1:]
     
     raw_signal = m_future_shifted - m_past  # l(t) where t is window end
     
