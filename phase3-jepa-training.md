@@ -75,7 +75,7 @@ for p in target_encoder.parameters():
 mask_token = nn.Parameter(torch.zeros(1, 1, 40))
 nn.init.trunc_normal_(mask_token, std=0.02)
 
-def apply_mask(x, mask):  # x: [B, 100, 40], mask: [B, 100] bool, True = masked
+def apply_mask(x, mask, mask_token):  # x: [B, 100, 40], mask: [B, 100] bool, True = masked
     x_masked = x.clone()
     x_masked[mask] = mask_token.squeeze()  # broadcast mask token to every masked position
     return x_masked
@@ -83,7 +83,7 @@ def apply_mask(x, mask):  # x: [B, 100, 40], mask: [B, 100] bool, True = masked
 
 ### 2.3 Predictor
 
-A separate, smaller Transformer — deliberately narrower than the encoder, matching the established pattern in the JEPA literature (I-JEPA's predictor is narrower than its encoder) since the predictor's job (map context representations + positional info to target representations) is simpler than the encoder's job (build a rich representation from raw input).
+A separate Transformer — deeper than the encoder (4 layers vs. 2) but **not** narrower in width. This corrects an earlier draft of this document, which incorrectly claimed the predictor was "narrower, matching I-JEPA" while simultaneously specifying `d_model=256`, identical to the encoder — those two statements contradicted each other, and I-JEPA's actual convention (predictor narrower in `d_model` than the encoder) is not what's used here. The real reason for keeping `d_model=256` identical to the encoder is given below, on its own merits, not as an alignment with I-JEPA's own choice.
 
 ```python
 class Predictor(nn.Module):
@@ -105,7 +105,7 @@ class Predictor(nn.Module):
         return self.output_proj(h)  # [B, 100, 256], prediction of target encoder's output
 ```
 
-**Why 4 layers for the predictor versus 2 for the encoder:** matches the established convention (predictor deeper is fine, predictor *narrower* in `d_model` is the usual I-JEPA choice, but we keep `d_model=256` identical to the encoder here specifically to avoid needing an extra projection layer between context encoder output and predictor input — one less place for a dimension-mismatch bug, consistent with this project's preference for minimizing surface area for silent errors over squeezing out marginal efficiency).
+**Why 4 layers for the predictor versus 2 for the encoder, and why `d_model=256` throughout:** more depth for the predictor is a reasonable choice given the literature's general pattern of giving the predictor its own separate capacity rather than reusing the encoder's. Keeping `d_model=256` identical to the encoder (rather than narrowing it, as I-JEPA itself does) avoids needing an extra projection layer between context-encoder output and predictor input — one less place for a dimension-mismatch bug, consistent with this project's preference for minimizing surface area for silent errors over squeezing out marginal parameter efficiency. This is a deliberate departure from I-JEPA's own convention, not an application of it.
 
 ---
 
@@ -118,16 +118,21 @@ def jepa_training_step(x, mask_fn, context_encoder, target_encoder, predictor, m
     """
     x: [B, 100, 40], a raw (unmasked) window from the dataloader -- same windows,
        same split, same session logic as every prior phase (Section 5).
-    mask_fn: either temporal_mask() (Phase 3a) or spatiotemporal_mask() (Phase 3b) -- Section 6.
+    mask_fn: either temporal_mask (Phase 3a) or spatiotemporal_mask (Phase 3b) -- Section 6.
+       Both now share an identical call signature (x, batch_size, ...) and return type
+       (mask, x_for_encoder), so this function needs no branching between the two variants.
     """
     B = x.shape[0]
-    mask = mask_fn(B)  # [B, 100] bool, True = masked position (Section 6 defines exact shapes)
+    mask, x_prepped = mask_fn(x, B)   # [B,100] bool mask, plus x with any field-level
+                                        # corruption already applied (Section 6.2) or
+                                        # unchanged (Section 6.1) -- mask_fn handles the difference
 
-    # 1. Context encoder sees the masked input.
-    x_masked = apply_mask(x, mask)
+    # 1. Context encoder sees x_prepped with temporally-masked positions replaced by the
+    #    learnable mask token.
+    x_masked = apply_mask(x_prepped, mask, mask_token)
     context_output = context_encoder(x_masked)          # [B, 100, 256]
 
-    # 2. Target encoder sees the FULL, unmasked input, no gradient.
+    # 2. Target encoder always sees the TRUE, uncorrupted input, no gradient.
     with torch.no_grad():
         target_output = target_encoder(x)                # [B, 100, 256]
         target_output = target_output.detach()
@@ -182,7 +187,7 @@ def collapse_prevention_loss(z, gamma=1.0, eps=1e-4):
     return loss_var + loss_cov  # equal weighting between the two sub-terms
 ```
 
-`LAMBDA_COLLAPSE = 1.0` (i.e., prediction loss and collapse-prevention loss are weighted equally in the total loss). This matches VICReg's own paper's practice of using comparable-magnitude coefficients for its variance/covariance/invariance terms rather than a large imbalance; do not tune this without explicitly noting the change and why.
+`LAMBDA_COLLAPSE = 1.0` (i.e., prediction loss and collapse-prevention loss are weighted equally in the total loss), and within `collapse_prevention_loss` itself, the variance and covariance sub-terms are also weighted 1:1. **This is a deliberate simplification, not an application of VICReg's own published defaults — stated accurately this time, after an earlier draft of this document incorrectly claimed it matched the original paper's practice.** I checked the actual VICReg paper directly: their published ImageNet coefficients are λ=25 (invariance), μ=25 (variance), ν=1 (covariance) — variance and covariance differ by 25×, not comparable magnitude. Those values were tuned for a very different setting (ResNet-50, 8192-dimensional projector, natural images). Adopting them here without evidence they transfer to a 256-dimensional LOB latent space would be its own unverified assumption, so this document uses equal 1:1 weighting instead, as a conservative, easy-to-reason-about starting point. Use the collapse diagnostic mandated in Section 9 (per-dimension embedding std, checked directly) to tell whether this weighting needs revisiting — if variance collapses while covariance loss stays near zero, that's the signal to increase the variance term's relative weight, not a fixed schedule to apply blindly.
 
 ---
 
@@ -225,9 +230,12 @@ Call `update_target_encoder(...)` once per training step, immediately after the 
 Multi-block masking along the time axis, following I-JEPA's own block-masking convention (several blocks rather than one, since a single contiguous block is easier to "cheat" on by interpolating from both edges).
 
 ```python
-def temporal_mask(batch_size, seq_len=100, n_blocks=4, block_size_range=(10, 20)):
-    """Returns [B, 100] bool tensor, True = masked. Each sample gets n_blocks
-    non-overlapping temporal blocks masked, block lengths drawn uniformly from block_size_range."""
+def temporal_mask(x, batch_size, seq_len=100, n_blocks=4, block_size_range=(10, 20)):
+    """Returns (mask, x_for_encoder). mask: [B, 100] bool, True = masked. x_for_encoder is
+    returned unchanged -- Phase 3a does no field-level corruption, only full-timestep masking,
+    which is applied later by apply_mask(). This signature and return shape deliberately match
+    spatiotemporal_mask() (Section 6.2) exactly, so jepa_training_step (Section 3) can call
+    either one identically without a special case."""
     masks = torch.zeros(batch_size, seq_len, dtype=torch.bool)
     for b in range(batch_size):
         occupied = torch.zeros(seq_len, dtype=torch.bool)
@@ -243,7 +251,7 @@ def temporal_mask(batch_size, seq_len=100, n_blocks=4, block_size_range=(10, 20)
             occupied[span] = True
             blocks_placed += 1
         masks[b] = occupied
-    return masks
+    return masks, x   # x returned unchanged, see docstring
 ```
 
 `attempts < 50` is a safety valve, not a tunable — with 4 blocks of length 10-20 in a 100-length sequence (40-80 positions out of 100), rejection sampling converges quickly; this cap exists only to guarantee termination, not to be hit in normal operation. **If this cap is ever actually hit in practice** (check by logging `attempts` and `blocks_placed` at least once during initial testing), that's a sign the block-size range needs revisiting — flag it rather than silently accepting fewer than 4 blocks.
@@ -262,12 +270,14 @@ FIELD_GROUPS = {
 
 def spatiotemporal_mask(x, batch_size, seq_len=100, n_blocks=4, block_size_range=(10, 20),
                           field_mask_prob=0.3):
-    """Returns (temporal_mask, field_mask_info). temporal_mask is identical to Section 6.1's
-    output. field_mask_info additionally zeroes out one randomly chosen field group, for a
-    field_mask_prob fraction of the temporally-VISIBLE positions, applied to the input tensor
-    directly (this is feature-level corruption, not a full-timestep mask, so it modifies x
-    in place rather than returning a second boolean mask of the same shape)."""
-    temporal_masked = temporal_mask(batch_size, seq_len, n_blocks, block_size_range)
+    """Returns (mask, x_for_encoder) -- same shape and calling convention as temporal_mask()
+    (Section 6.1), so jepa_training_step (Section 3) can call either interchangeably.
+    mask is the temporal block-mask, identical in meaning to Section 6.1's. x_for_encoder
+    additionally has one randomly chosen field group zeroed out, for a field_mask_prob
+    fraction of the temporally-VISIBLE positions -- this is feature-level corruption applied
+    directly to the input tensor, distinct from the full-timestep mask-token replacement that
+    apply_mask() performs afterward on the temporally-masked positions."""
+    temporal_masked, _ = temporal_mask(x, batch_size, seq_len, n_blocks, block_size_range)
     x_out = x.clone()
     field_names = list(FIELD_GROUPS.keys())
     for b in range(batch_size):

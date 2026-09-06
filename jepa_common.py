@@ -7,6 +7,7 @@ Strict Compliance with Phase 3 Specification (phase3-jepa-training.md):
   1. JEPABackbone: exact extraction of SimLOB's FCN1 + 2-layer TransformerEncoder (no FCN2/reduce_proj).
   2. Fixed-length sequence masking (seq_len=100) using learnable mask_token (trunc_normal std=0.02).
   3. Multi-block temporal masking (Phase 3a: 4 blocks, length 10-20, overlap rejection).
+     Shared call signature (x, batch_size, ...) and return type (mask, x_for_encoder).
   4. Spatio-temporal masking (Phase 3b: temporal masking + 30% of visible timesteps zero one field group).
   5. Predictor: 4-layer Transformer with learnable positional embedding and output projection.
   6. Masked-only prediction loss + VICReg variance & covariance collapse-prevention loss (lambda=1.0).
@@ -117,11 +118,16 @@ def apply_mask(x, mask, mask_token=None):
     return x_masked
 
 
-def temporal_mask(batch_size, seq_len=100, n_blocks=4, block_size_range=(10, 20), device=None):
+def temporal_mask(x, batch_size, seq_len=100, n_blocks=4, block_size_range=(10, 20), device=None):
     """
-    Returns [B, 100] bool tensor, True = masked. Each sample gets n_blocks
-    non-overlapping temporal blocks masked, block lengths drawn uniformly from block_size_range.
+    Returns (masks, x_for_encoder).
+    masks: [B, 100] bool tensor, True = masked.
+    x_for_encoder is returned unchanged -- Phase 3a does no field-level corruption,
+    only full-timestep masking applied later by apply_mask().
+    Shared call signature and return type with spatiotemporal_mask() (Section 6.2).
     """
+    if device is None and hasattr(x, 'device'):
+        device = x.device
     masks = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
     for b in range(batch_size):
         occupied = torch.zeros(seq_len, dtype=torch.bool, device=device)
@@ -137,7 +143,7 @@ def temporal_mask(batch_size, seq_len=100, n_blocks=4, block_size_range=(10, 20)
             occupied[span] = True
             blocks_placed += 1
         masks[b] = occupied
-    return masks
+    return masks, x
 
 
 FIELD_GROUPS = {
@@ -149,15 +155,17 @@ FIELD_GROUPS = {
 
 
 def spatiotemporal_mask(x, batch_size, seq_len=100, n_blocks=4, block_size_range=(10, 20),
-                        field_mask_prob=0.3):
+                        field_mask_prob=0.3, device=None):
     """
     Returns (temporal_masked, x_out).
-    temporal_masked is identical to Section 6.1's output [B, 100] bool.
-    x_out additionally zeroes out one randomly chosen field group, for a
-    field_mask_prob fraction of the temporally-VISIBLE positions.
+    Same shape and calling convention as temporal_mask() (Section 6.1).
+    temporal_masked is identical in meaning to Section 6.1's [B, 100] bool mask.
+    x_out additionally has one randomly chosen field group zeroed out on 30% of
+    the temporally-VISIBLE positions.
     """
-    device = x.device
-    temporal_masked = temporal_mask(batch_size, seq_len, n_blocks, block_size_range, device=device)
+    if device is None and hasattr(x, 'device'):
+        device = x.device
+    temporal_masked, _ = temporal_mask(x, batch_size, seq_len, n_blocks, block_size_range, device=device)
     x_out = x.clone()
     field_names = list(FIELD_GROUPS.keys())
     for b in range(batch_size):
@@ -165,7 +173,6 @@ def spatiotemporal_mask(x, batch_size, seq_len=100, n_blocks=4, block_size_range
         n_to_corrupt = int(len(visible_positions) * field_mask_prob)
         if n_to_corrupt == 0:
             continue
-        # Device-safe index selection
         perm = torch.randperm(len(visible_positions), device=visible_positions.device)[:n_to_corrupt]
         chosen_positions = visible_positions[perm]
         for pos in chosen_positions:
@@ -246,33 +253,20 @@ def jepa_training_step(x, mask_fn, context_encoder, target_encoder, predictor, m
     """
     Exact data flow from Section 3 of phase3-jepa-training.md.
     x: [B, 100, 40], a raw (unmasked) window from the dataloader.
-    mask_fn: either temporal_mask() (Phase 3a) or spatiotemporal_mask() (Phase 3b).
+    mask_fn: either temporal_mask (Phase 3a) or spatiotemporal_mask (Phase 3b).
+       Both share an identical call signature (x, batch_size, ...) and return type
+       (mask, x_for_encoder), so this function needs no branching between the two variants.
     """
     B = x.shape[0]
-    
-    # Handle mask_fn signature flexibility (Phase 3a vs 3b)
-    if callable(mask_fn):
-        try:
-            res = mask_fn(x, B)
-        except TypeError:
-            res = mask_fn(B)
-    else:
-        res = mask_fn
-
-    if isinstance(res, tuple):
-        mask, x_corrupted = res
-        x_input = x_corrupted
-    else:
-        mask = res
-        x_input = x
+    mask, x_prepped = mask_fn(x, B)
 
     mask = mask.to(x.device)
 
-    # 1. Context encoder sees the masked input.
-    x_masked = apply_mask(x_input, mask, mask_token)
+    # 1. Context encoder sees x_prepped with temporally-masked positions replaced by mask token.
+    x_masked = apply_mask(x_prepped, mask, mask_token)
     context_output = context_encoder(x_masked)          # [B, 100, 256]
 
-    # 2. Target encoder sees the FULL, unmasked input, no gradient.
+    # 2. Target encoder always sees the TRUE, uncorrupted input, no gradient.
     with torch.no_grad():
         target_output = target_encoder(x)                # [B, 100, 256]
         target_output = target_output.detach()
@@ -429,6 +423,7 @@ class JEPALightningModule(pl.LightningModule):
         self.total_steps = total_steps
         self.lambda_collapse = lambda_collapse
         self.seq_len = seq_len
+        self.mask_fn = temporal_mask if variant == '3a' else spatiotemporal_mask
 
         # 1. Context and Target Encoders
         self.context_encoder = JEPABackbone(n_features=n_features, d_model=d_model)
@@ -451,26 +446,22 @@ class JEPALightningModule(pl.LightningModule):
         x = batch if isinstance(batch, torch.Tensor) else batch[0]
         B = x.shape[0]
 
-        # 1. Generate mask according to variant
-        if self.variant == '3a':
-            mask = temporal_mask(B, seq_len=self.seq_len, device=x.device)
-            x_masked = apply_mask(x, mask, self.mask_token)
-        elif self.variant == '3b':
-            mask, x_corrupted = spatiotemporal_mask(x, B, seq_len=self.seq_len)
-            mask = mask.to(x.device)
-            x_masked = apply_mask(x_corrupted, mask, self.mask_token)
+        # Shared call signature: mask_fn(x, B, seq_len=...) returns (mask, x_prepped)
+        mask, x_prepped = self.mask_fn(x, B, seq_len=self.seq_len)
+        mask = mask.to(x.device)
 
-        # 2. Context encoder forward on masked input
+        # 1. Context encoder forward on masked input
+        x_masked = apply_mask(x_prepped, mask, self.mask_token)
         context_output = self.context_encoder(x_masked)      # [B, 100, 256]
 
-        # 3. Target encoder forward on FULL, unmasked input (no gradient)
+        # 2. Target encoder forward on FULL, unmasked input (no gradient)
         with torch.no_grad():
             target_output = self.target_encoder(x).detach()   # [B, 100, 256]
 
-        # 4. Predictor maps context output to target output prediction
+        # 3. Predictor maps context output to target output prediction
         predicted_output = self.predictor(context_output)     # [B, 100, 256]
 
-        # 5. Losses
+        # 4. Losses
         loss_pred = prediction_loss(predicted_output, target_output, mask)
         loss_collapse = collapse_prevention_loss(context_output)
         total_loss = loss_pred + self.lambda_collapse * loss_collapse
@@ -490,14 +481,10 @@ class JEPALightningModule(pl.LightningModule):
         x = batch if isinstance(batch, torch.Tensor) else batch[0]
         B = x.shape[0]
 
-        if self.variant == '3a':
-            mask = temporal_mask(B, seq_len=self.seq_len, device=x.device)
-            x_masked = apply_mask(x, mask, self.mask_token)
-        elif self.variant == '3b':
-            mask, x_corrupted = spatiotemporal_mask(x, B, seq_len=self.seq_len)
-            mask = mask.to(x.device)
-            x_masked = apply_mask(x_corrupted, mask, self.mask_token)
+        mask, x_prepped = self.mask_fn(x, B, seq_len=self.seq_len)
+        mask = mask.to(x.device)
 
+        x_masked = apply_mask(x_prepped, mask, self.mask_token)
         context_output = self.context_encoder(x_masked)
         with torch.no_grad():
             target_output = self.target_encoder(x).detach()

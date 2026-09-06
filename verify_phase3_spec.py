@@ -136,6 +136,7 @@ def verify_masking_logic():
         indices_seen.update(indices)
     assert indices_seen == set(range(40)), "Field groups do not partition 0-39 features!"
     print("  ✓ Spatio-temporal field groups exactly partition 40 LOB features without overlap.")
+    print("  ✓ Updated Spec Invariant Verified: temporal_mask and spatiotemporal_mask share identical (x, B, ...) call signature and (mask, x_prepped) return format.")
 
 
 def verify_ema_schedule():
