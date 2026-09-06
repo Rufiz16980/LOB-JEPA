@@ -60,6 +60,7 @@ from downstream_common import (
 
 ALL_STOCKS = ['sz000001', 'sz000002', 'sz000858', 'sz300147', 'sz002415']
 LAMBDA_COLLAPSE = 1.0
+GLOBAL_MASK_TOKEN = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -96,15 +97,23 @@ def init_mask_token(n_features=40):
     return mask_token
 
 
-def apply_mask(x, mask, mask_token):
+def apply_mask(x, mask, mask_token=None):
     """
     x: [B, 100, 40]
     mask: [B, 100] bool, True = masked
-    mask_token: [1, 1, 40] Parameter
+    mask_token: [1, 1, 40] Parameter (optional, uses/initializes default if None)
     Replaces all masked timesteps with the learnable mask token.
     """
+    global GLOBAL_MASK_TOKEN
     x_masked = x.clone()
-    x_masked[mask] = mask_token.squeeze(0).squeeze(0)  # broadcast [40] to all [M, 40] masked positions
+    if mask_token is None:
+        if GLOBAL_MASK_TOKEN is None:
+            GLOBAL_MASK_TOKEN = init_mask_token(x.shape[-1]).to(x.device)
+        mask_token = GLOBAL_MASK_TOKEN
+    tok = mask_token.squeeze()
+    if tok.device != x.device:
+        tok = tok.to(x.device)
+    x_masked[mask] = tok  # broadcast [40] to all [M, 40] masked positions
     return x_masked
 
 
@@ -156,10 +165,13 @@ def spatiotemporal_mask(x, batch_size, seq_len=100, n_blocks=4, block_size_range
         n_to_corrupt = int(len(visible_positions) * field_mask_prob)
         if n_to_corrupt == 0:
             continue
-        chosen_positions = visible_positions[torch.randperm(len(visible_positions))[:n_to_corrupt]]
+        # Device-safe index selection
+        perm = torch.randperm(len(visible_positions), device=visible_positions.device)[:n_to_corrupt]
+        chosen_positions = visible_positions[perm]
         for pos in chosen_positions:
+            p_idx = pos.item()
             field = field_names[torch.randint(0, len(field_names), (1,)).item()]
-            x_out[b, pos, FIELD_GROUPS[field]] = 0.0   # zero out that field group at that timestep
+            x_out[b, p_idx, FIELD_GROUPS[field]] = 0.0   # zero out that field group at that timestep
     return temporal_masked, x_out
 
 
@@ -227,7 +239,57 @@ def collapse_prevention_loss(z, gamma=1.0, eps=1e-4):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5.  TARGET ENCODER EMA UPDATE (SECTION 4)
+# 5.  JEPA TRAINING STEP — LITERAL SPECIFICATION CODE (SECTION 3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def jepa_training_step(x, mask_fn, context_encoder, target_encoder, predictor, mask_token):
+    """
+    Exact data flow from Section 3 of phase3-jepa-training.md.
+    x: [B, 100, 40], a raw (unmasked) window from the dataloader.
+    mask_fn: either temporal_mask() (Phase 3a) or spatiotemporal_mask() (Phase 3b).
+    """
+    B = x.shape[0]
+    
+    # Handle mask_fn signature flexibility (Phase 3a vs 3b)
+    if callable(mask_fn):
+        try:
+            res = mask_fn(x, B)
+        except TypeError:
+            res = mask_fn(B)
+    else:
+        res = mask_fn
+
+    if isinstance(res, tuple):
+        mask, x_corrupted = res
+        x_input = x_corrupted
+    else:
+        mask = res
+        x_input = x
+
+    mask = mask.to(x.device)
+
+    # 1. Context encoder sees the masked input.
+    x_masked = apply_mask(x_input, mask, mask_token)
+    context_output = context_encoder(x_masked)          # [B, 100, 256]
+
+    # 2. Target encoder sees the FULL, unmasked input, no gradient.
+    with torch.no_grad():
+        target_output = target_encoder(x)                # [B, 100, 256]
+        target_output = target_output.detach()
+
+    # 3. Predictor takes context encoder's output and predicts target output
+    predicted_output = predictor(context_output)          # [B, 100, 256]
+
+    # 4. Loss only at masked positions.
+    loss_pred = prediction_loss(predicted_output, target_output, mask)   # Section 3.1
+    loss_collapse = collapse_prevention_loss(context_output)              # Section 3.2
+
+    total_loss = loss_pred + LAMBDA_COLLAPSE * loss_collapse
+    return total_loss, loss_pred, loss_collapse
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  TARGET ENCODER EMA UPDATE (SECTION 4)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def update_target_encoder(context_encoder, target_encoder, momentum):
@@ -249,7 +311,7 @@ def get_momentum(step, total_steps, start=0.996, end=1.0):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6.  EVALUATION ADAPTER (SECTION 7.2)
+# 7.  EVALUATION ADAPTER (SECTION 7.2)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class JEPAEncoderForEval(nn.Module):
@@ -268,7 +330,7 @@ class JEPAEncoderForEval(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7.  POOLED 5-STOCK DATA PIPELINE (SECTION 5)
+# 8.  POOLED 5-STOCK DATA PIPELINE (SECTION 5)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PooledLOBDataset(Dataset):
@@ -278,7 +340,13 @@ class PooledLOBDataset(Dataset):
     windows via (stock_idx, start_idx) pairs to prevent OOM.
     """
     def __init__(self, stock_features_list, sample_index_pairs, seq_len=100):
-        self.stock_features = [torch.tensor(f, dtype=torch.float32) for f in stock_features_list]
+        tensors = []
+        for f in stock_features_list:
+            t = torch.tensor(f, dtype=torch.float32)
+            if hasattr(t, 'share_memory_'):
+                t.share_memory_()
+            tensors.append(t)
+        self.stock_features = tensors
         self.sample_index_pairs = sample_index_pairs  # np.ndarray of shape [N, 2]: (stock_idx, start_idx)
         self.seq_len = seq_len
 
@@ -298,8 +366,8 @@ def prepare_pooled_datasets(stocks=ALL_STOCKS, data_dir='data', seq_len=100):
     and returns PooledLOBDataset instances for train and validation splits.
     """
     stock_features = []
-    train_pairs = []
-    val_pairs = []
+    train_pairs_list = []
+    val_pairs_list = []
     
     for s_idx, stock in enumerate(stocks):
         csv_path = os.path.join(data_dir, f"{stock}-level10_processed.csv")
@@ -315,15 +383,17 @@ def prepare_pooled_datasets(stocks=ALL_STOCKS, data_dir='data', seq_len=100):
         t_starts = get_window_indices(df, train_mask, session_ids, seq_len=seq_len)
         v_starts = get_window_indices(df, val_mask, session_ids, seq_len=seq_len)
         
-        for st in t_starts:
-            train_pairs.append((s_idx, st))
-        for sv in v_starts:
-            val_pairs.append((s_idx, sv))
+        if len(t_starts) > 0:
+            s_col_t = np.full(len(t_starts), s_idx, dtype=np.int32)
+            train_pairs_list.append(np.column_stack((s_col_t, t_starts.astype(np.int32))))
+        if len(v_starts) > 0:
+            s_col_v = np.full(len(v_starts), s_idx, dtype=np.int32)
+            val_pairs_list.append(np.column_stack((s_col_v, v_starts.astype(np.int32))))
             
         print(f"  ✓ {stock}: {len(t_starts):,} train windows, {len(v_starts):,} val windows")
 
-    train_pairs = np.array(train_pairs, dtype=np.int32)
-    val_pairs = np.array(val_pairs, dtype=np.int32)
+    train_pairs = np.concatenate(train_pairs_list, axis=0) if train_pairs_list else np.empty((0, 2), dtype=np.int32)
+    val_pairs = np.concatenate(val_pairs_list, axis=0) if val_pairs_list else np.empty((0, 2), dtype=np.int32)
     
     train_ds = PooledLOBDataset(stock_features, train_pairs, seq_len=seq_len)
     val_ds = PooledLOBDataset(stock_features, val_pairs, seq_len=seq_len)
@@ -335,7 +405,7 @@ def prepare_pooled_datasets(stocks=ALL_STOCKS, data_dir='data', seq_len=100):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8.  PYTORCH LIGHTNING JEPA MODULE (SECTION 3 & SECTION 8)
+# 9.  PYTORCH LIGHTNING JEPA MODULE (SECTION 3 & SECTION 8)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class JEPALightningModule(pl.LightningModule):
@@ -458,7 +528,7 @@ class JEPALightningModule(pl.LightningModule):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 9.  CHECKPOINT LOADING & EVALUATION HARNESS ADAPTERS
+# 10. CHECKPOINT LOADING & EVALUATION HARNESS ADAPTERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_frozen_jepa_encoder(variant: str, ckpt_dir: str = None, device: str = 'cuda') -> nn.Module:
@@ -479,6 +549,8 @@ def load_frozen_jepa_encoder(variant: str, ckpt_dir: str = None, device: str = '
     for k, v in state_dict.items():
         if k.startswith(prefix):
             backbone_dict[k[len(prefix):]] = v
+
+    assert len(backbone_dict) > 0, f"No context_encoder keys found in checkpoint {best_path}!"
 
     backbone = JEPABackbone()
     load_res = backbone.load_state_dict(backbone_dict, strict=True)
